@@ -1,427 +1,211 @@
+import os
+import json
 import time
 import random
-import itertools
-from typing import List, Dict, Optional, Union
-from urllib.parse import urljoin
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import pandas as pd
+import matplotlib.pyplot as plt
+from collections import Counter
+from statistics import mean, median
+from typing import Dict, List, Optional
 
 
-ProxyType = Union[str, Dict[str, str]]  # "http://host:port" or {"http": "...", "https": "..."}
-
-
-class ProxyUnavailable(Exception):
-    pass
-
-
-class ShopifyScraperSkeleton:
+class ShopifyScraper:
     """
-    Robust Shopify products.json scraper with optional proxy rotation and failure handling.
-
-    Example:
-        scraper = ShopifyScraper(
-            "https://example.myshopify.com",
-            proxies=["http://1.2.3.4:8080", "http://user:pass@5.6.7.8:3128"],
-            delay=1.0,
-            timeout=10.0
-        )
-        products = scraper.scrape_all_products()
+    A full-featured Shopify product scraper and analytics tool.
+    Capabilities:
+    - Scrapes all products from a Shopify store (using proxy rotation if configured)
+    - Performs tag, vendor, and price analysis
+    - Saves daily snapshots for trend tracking
+    - Generates visualizations (price distribution, vendor breakdown)
     """
 
-    def __init__(
-        self,
-        shop_url: str,
-        proxies: Optional[List[ProxyType]] = None,
-        rotate_proxies: bool = True,
-        delay: float = 1.0,
-        timeout: float = 10.0,
-        max_pages: int = 100,
-        max_retries: int = 3,
-        backoff_factor: float = 0.5,
-        proxy_cooldown: float = 300.0,  # seconds to blacklist a failing proxy
-        user_agent: Optional[str] = None,
-    ):
-        if not shop_url.startswith("http"):
-            shop_url = "https://" + shop_url
-        if not shop_url.endswith("/"):
-            shop_url += "/"
-        self.base_url = shop_url
+    def __init__(self, store_url: str, proxies: Optional[List[str]] = None, data_dir: str = "data"):
+        # Normalize the store URL
+        store_url = store_url.strip().rstrip("/")
 
-        self.delay = float(delay)
-        self.timeout = float(timeout)
-        self.max_pages = int(max_pages)
-        self.max_retries = int(max_retries)
-        self.backoff_factor = float(backoff_factor)
-        self.proxy_cooldown = float(proxy_cooldown)
+        # If the user forgot to include https:// or http://
+        if not store_url.startswith(("http://", "https://")):
+            store_url = "https://" + store_url
 
-        self.session = requests.Session()
-        self._mount_retries(self.session, max_retries=max_retries, backoff_factor=backoff_factor)
+        self.store_url = store_url
+        self.proxies = proxies or []
+        self.data_dir = data_dir
+        self.products_cache: List[Dict] = []
 
-        # Default headers
-        self.session.headers.update({
-            "Accept": "application/json",
-            "User-Agent": user_agent or self._random_user_agent(),
-        })
-
-        # Proxy handling structures
-        self.rotate_proxies = rotate_proxies and bool(proxies)
-        self._raw_proxies = proxies[:] if proxies else []
-        self._proxy_cycle = itertools.cycle(self._raw_proxies) if self._raw_proxies else None
-        # track failing proxies: {proxy_repr: fail_time}
-        self._proxy_blacklist: Dict[str, float] = {}
-        # simple failure counts
-        self._proxy_fail_counts: Dict[str, int] = {}
-
-    # ----------------------
-    # Public proxy utilities
-    # ----------------------
-    def add_proxy(self, proxy: ProxyType) -> None:
-        self._raw_proxies.append(proxy)
-        self._proxy_cycle = itertools.cycle(self._raw_proxies)
-
-    def remove_proxy(self, proxy: ProxyType) -> None:
-        self._raw_proxies = [p for p in self._raw_proxies if p != proxy]
-        self._proxy_cycle = itertools.cycle(self._raw_proxies) if self._raw_proxies else None
-        self._proxy_blacklist.pop(self._proxy_key(proxy), None)
-        self._proxy_fail_counts.pop(self._proxy_key(proxy), None)
-
-    # ----------------------
-    # Core scraping methods
-    # ----------------------
-    def scrape_all_products(self) -> List[Dict]:
-        """
-        Iterate pages and collect all products. Stops when page returns no products
-        or when max_pages is reached.
-        """
-        all_products = []
-        page = 1
-
-        while page <= self.max_pages:
-            data = self._get_page_with_retries(page)
-            if not data or not data.get("products"):
-                break
-            products = data["products"]
-            all_products.extend(products)
-            print(f"[INFO] Fetched page {page} with {len(products)} products.")
-            page += 1
-            time.sleep(self.delay)
-
-        print(f"[DONE] Scraped {len(all_products)} total products.")
-        return all_products
-
-    def _get_page_with_retries(self, page: int) -> Optional[Dict]:
-        """
-        Wrapper that handles retries, rate-limits (429), backoff, and proxy rotation.
-        """
-        url = urljoin(self.base_url, f"products.json?page={page}")
-        attempt = 0
-        while attempt < self.max_retries:
-            attempt += 1
-            try:
-                resp = self._request("GET", url)
-                if resp is None:
-                    # network/proxy failure: try again (next proxy or backoff)
-                    raise requests.RequestException("No response received (proxy/network error).")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if "products" not in data:
-                        print(f"[WARN] 'products' key missing in response for page {page}")
-                        return None
-                    return data
-                elif resp.status_code == 429:
-                    wait = self.backoff_factor * (2 ** (attempt - 1))
-                    print(f"[WARN] 429 rate limited. Sleeping {wait:.1f}s and retrying...")
-                    time.sleep(wait)
-                    continue
-                elif 500 <= resp.status_code < 600:
-                    wait = self.backoff_factor * (2 ** (attempt - 1))
-                    print(f"[WARN] Server error {resp.status_code}. Sleeping {wait:.1f}s then retrying...")
-                    time.sleep(wait)
-                    continue
-                else:
-                    print(f"[ERROR] Unexpected status {resp.status_code} for page {page}")
-                    return None
-            except requests.RequestException as e:
-                wait = self.backoff_factor * (2 ** (attempt - 1))
-                print(f"[WARN] Request exception: {e}. Backing off {wait:.1f}s then retrying...")
-                time.sleep(wait)
-                continue
-
-        print(f"[ERROR] Exhausted retries for page {page}")
-        return None
-
-    # ----------------------
-    # HTTP + Proxy management
-    # ----------------------
-    def _request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
-        """
-        Performs a single HTTP request. If proxies are configured and rotation enabled,
-        select a proxy and try; on proxy failure mark proxy as failing and rotate.
-        Returns requests.Response or None on fatal network/proxy error.
-        """
-        kwargs.setdefault("timeout", self.timeout)
-
-        # If no proxies are configured, simple request
-        if not self._raw_proxies:
-            try:
-                return self.session.request(method, url, **kwargs)
-            except requests.RequestException as e:
-                print(f"[ERROR] Request failed without proxy: {e}")
-                return None
-
-        # Try a number of proxies (up to count of proxies)
-        proxies_tried = 0
-        max_try = max(1, len(self._raw_proxies))
-        while proxies_tried < max_try:
-            proxy = self._get_next_proxy()
-            if proxy is None:
-                # no proxies available (all blacklisted)
-                raise ProxyUnavailable("No available proxies (all blacklisted).")
-            proxy_key = self._proxy_key(proxy)
-
-            # Skip blacklisted proxies
-            if self._is_blacklisted(proxy_key):
-                proxies_tried += 1
-                continue
-
-            proxy_dict = self._normalize_proxy(proxy)
-            try:
-                resp = self.session.request(method, url, proxies=proxy_dict, **kwargs)
-                # If proxy returned 403/407/5xx connection errors, treat as proxy failure
-                if resp.status_code in (502, 503, 504):
-                    self._record_proxy_failure(proxy_key)
-                    proxies_tried += 1
-                    print(f"[WARN] Proxy {proxy_key} produced {resp.status_code}; trying next proxy.")
-                    continue
-                # success (including 200/404/429)
-                # reset fail count on successful proxy response
-                self._proxy_fail_counts.pop(proxy_key, None)
-                return resp
-            except requests.ProxyError as e:
-                # proxy connection problem -> mark and try next
-                self._record_proxy_failure(proxy_key)
-                proxies_tried += 1
-                print(f"[WARN] ProxyError with {proxy_key}: {e}. Trying next proxy.")
-                continue
-            except requests.RequestException as e:
-                # network error - could be proxy or remote; mark proxy as failed conservatively
-                self._record_proxy_failure(proxy_key)
-                proxies_tried += 1
-                print(f"[WARN] RequestException with {proxy_key}: {e}. Trying next proxy.")
-                continue
-
-        # if we reach here, all proxies tried & failed
-        print("[ERROR] All proxies tried and failed for this request.")
-        return None
-
-    # ----------------------
-    # Proxy helpers
-    # ----------------------
-    def _get_next_proxy(self) -> Optional[ProxyType]:
-        if not self._raw_proxies:
+        os.makedirs(self.data_dir, exist_ok=True)
+   
+    def _get_proxy(self) -> Optional[Dict[str, str]]:
+        """Returns a random proxy (if any available)."""
+        if not self.proxies:
             return None
-        if not self.rotate_proxies:
-            return self._raw_proxies[0]
-        # rotate until we find a non-blacklisted proxy or exhausted
-        for _ in range(len(self._raw_proxies)):
-            try:
-                p = next(self._proxy_cycle)
-            except Exception:
-                # rebuild cycle if needed
-                self._proxy_cycle = itertools.cycle(self._raw_proxies)
-                p = next(self._proxy_cycle)
-            if not self._is_blacklisted(self._proxy_key(p)):
-                return p
-        return None  # all blacklisted
-
-    def _proxy_key(self, proxy: ProxyType) -> str:
-        # generate a simple key to identify a proxy (stringify)
-        if isinstance(proxy, dict):
-            return repr(proxy)
-        return str(proxy)
-
-    def _is_blacklisted(self, proxy_key: str) -> bool:
-        t = self._proxy_blacklist.get(proxy_key)
-        if not t:
-            return False
-        # if cooldown expired, remove from blacklist
-        if time.time() - t > self.proxy_cooldown:
-            self._proxy_blacklist.pop(proxy_key, None)
-            self._proxy_fail_counts.pop(proxy_key, None)
-            return False
-        return True
-
-    def _record_proxy_failure(self, proxy_key: str) -> None:
-        # increment fail count; blacklist if threshold exceeded
-        cnt = self._proxy_fail_counts.get(proxy_key, 0) + 1
-        self._proxy_fail_counts[proxy_key] = cnt
-        # threshold: 2 failures -> temporary blacklist
-        if cnt >= 2:
-            self._proxy_blacklist[proxy_key] = time.time()
-            print(f"[WARN] Blacklisting proxy {proxy_key} for {self.proxy_cooldown}s due to repeated failures.")
-
-    def _normalize_proxy(self, proxy: ProxyType) -> Dict[str, str]:
-        """
-        Convert proxy spec into requests-style proxies dict.
-        Accepts:
-            - string "http://host:port"
-            - dict {"http": "...", "https": "..."}
-        Returns proxies dict for requests.
-        """
-        if isinstance(proxy, dict):
-            return proxy
-        # assume string; apply to both http and https
+        proxy = random.choice(self.proxies)
         return {"http": proxy, "https": proxy}
 
-    # ----------------------
-    # Utilities
-    # ----------------------
-    def _mount_retries(self, session: requests.Session, max_retries: int = 3, backoff_factor: float = 0.5) -> None:
-        """
-        Mount HTTPAdapter that retries on connection errors.
-        """
-        retries = Retry(
-            total=max_retries,
-            backoff_factor=backoff_factor,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]),
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
+    def _fetch_page(self, page: int = 1) -> Optional[List[Dict]]:
+        """Fetches one page of products.json."""
+        url = f"{self.store_url}/products.json?page={page}&limit=250"
+        try:
+            response = requests.get(url, proxies=self._get_proxy(), timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("products", [])
+        except Exception as e:
+            print(f"[WARN] Failed to fetch page {page}: {e}")
+            return None
 
-    def _random_user_agent(self) -> str:
-        # Simple small pool; in production you could expand or accept user-specified UA.
-        uas = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-            " Chrome/117.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko)"
-            " Version/16.0 Safari/605.1.15",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)"
-            " Chrome/117.0.0.0 Safari/537.36",
-        ]
-        return random.choice(uas)
+    def scrape_all_products(self) -> List[Dict]:
+        """Fetches all products across paginated JSON pages."""
+        products = []
+        page = 1
+        print(f"[INFO] Starting scrape for {self.store_url}")
+        while True:
+            page_data = self._fetch_page(page)
+            if not page_data:
+                break
+            products.extend(page_data)
+            print(f"[INFO] Page {page}: {len(page_data)} products")
+            page += 1
+            if len(page_data) < 250:
+                break
+            time.sleep(1)  # be polite
+        print(f"[INFO] Scraped total {len(products)} products.")
+        self.products_cache = products
+        return products
 
-import pandas as pd
-from statistics import mean, median
-from collections import Counter
-
-class ShopifyScraper(ShopifyScraperSkeleton):
-    """
-    Extends ShopifyScraper with analysis capabilities.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.products_cache: list = []
-
-    # ----------------------
-    # Cache products for analysis
-    # ----------------------
-    def scrape_and_cache(self) -> None:
-        self.products_cache = self.scrape_all_products()
-
-    # ----------------------
-    # Price analysis
-    # ----------------------
-    def price_summary(self) -> dict:
+    def save_snapshot(self, filename: Optional[str] = None) -> str:
+        """Saves current product cache to timestamped JSON file."""
         if not self.products_cache:
-            raise ValueError("No products cached. Call scrape_and_cache() first.")
+            raise ValueError("No products cached. Run scrape_all_products() first.")
 
+        if not filename:
+            date = time.strftime("%Y-%m-%d")
+            filename = os.path.join(self.data_dir, f"products_{date}.json")
+
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(self.products_cache, f, indent=2)
+        print(f"[INFO] Snapshot saved: {filename}")
+        return filename
+
+    def load_snapshot(self, filename: str) -> None:
+        """Loads product data from a saved snapshot."""
+        with open(filename, "r", encoding="utf-8") as f:
+            self.products_cache = json.load(f)
+        print(f"[INFO] Loaded snapshot: {filename}")
+
+    def tag_summary(self, top_n: int = 10) -> Dict[str, int]:
+        """Returns the most common tags across products (handles string or list formats)."""
+        tags = Counter()
+        for p in self.products_cache:
+            tag_data = p.get("tags", [])
+            
+            # Normalize: ensure we always have a list
+            if isinstance(tag_data, str):
+                tag_list = [t.strip() for t in tag_data.split(",") if t.strip()]
+            elif isinstance(tag_data, list):
+                tag_list = [t.strip() for t in tag_data if isinstance(t, str) and t.strip()]
+            else:
+                tag_list = []
+
+            for tag in tag_list:
+                tags[tag] += 1
+
+        top_tags = dict(tags.most_common(top_n))
+        print(f"[INFO] Top {top_n} tags: {top_tags}")
+        return top_tags
+
+
+    def price_summary(self) -> Dict[str, float]:
+        """Returns basic statistics about variant prices."""
         prices = []
         for p in self.products_cache:
-            for variant in p.get("variants", []):
+            for v in p.get("variants", []):
                 try:
-                    prices.append(float(variant.get("price", 0)))
-                except ValueError:
+                    prices.append(float(v.get("price", 0)))
+                except (ValueError, TypeError):
                     continue
 
         if not prices:
+            print("[WARN] No prices found.")
             return {}
 
-        return {
+        stats = {
             "count": len(prices),
             "min": min(prices),
             "max": max(prices),
             "mean": mean(prices),
             "median": median(prices),
         }
+        print(f"[INFO] Price summary: {stats}")
+        return stats
 
-    # ----------------------
-    # Inventory / stock analysis
-    # ----------------------
-    def stock_summary(self) -> dict:
-        """
-        Summarizes stock availability (in-stock vs out-of-stock) based on the 'available' field.
-        This works even when inventory_quantity is not publicly available.
-        """
-        if not self.products_cache:
-            raise ValueError("No products cached. Call scrape_and_cache() first.")
-
-        in_stock = 0
-        out_of_stock = 0
-        unavailable_products = []
-
+    def stock_summary(self) -> Dict[str, int]:
+        """Estimates stock availability (based on variant 'available' flag)."""
+        available, unavailable = 0, 0
         for p in self.products_cache:
             for v in p.get("variants", []):
                 if v.get("available", False):
-                    in_stock += 1
+                    available += 1
                 else:
-                    out_of_stock += 1
-                    unavailable_products.append({
-                        "id": p.get("id"),
-                        "title": p.get("title"),
-                        "variant": v.get("title"),
-                    })
+                    unavailable += 1
+        return {"available": available, "unavailable": unavailable}
 
-        return {
-            "in_stock_variants": in_stock,
-            "out_of_stock_variants": out_of_stock,
-            "out_of_stock_products": unavailable_products
-        }
+    def plot_price_distribution(self, bins: int = 20):
+        """Plots histogram of variant prices."""
+        prices = [
+            float(v["price"])
+            for p in self.products_cache
+            for v in p.get("variants", [])
+            if v.get("price")
+        ]
+        if not prices:
+            print("[WARN] No price data to plot.")
+            return
 
-    # ----------------------
-    # Products by vendor / type
-    # ----------------------
-    def count_by_field(self, field: str = "vendor") -> dict:
+        plt.figure(figsize=(8, 5))
+        plt.hist(prices, bins=bins, alpha=0.7)
+        plt.title("Price Distribution")
+        plt.xlabel("Price")
+        plt.ylabel("Number of Variants")
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+    def plot_distribution(self, field: str = "vendor", top_n: int = 10):
+        """Plots a bar chart of top vendors or product types."""
         counter = Counter()
         for p in self.products_cache:
-            key = p.get(field, "Unknown")
+            key = p.get(field) or "Unknown"
             counter[key] += 1
-        return dict(counter)
+        top = dict(counter.most_common(top_n))
 
-    # ----------------------
-    # Variant analysis
-    # ----------------------
-    def variant_summary(self) -> dict:
-        variant_counts = []
-        option_counter = Counter()
-        for p in self.products_cache:
-            variants = p.get("variants", [])
-            variant_counts.append(len(variants))
-            for v in variants:
-                for opt in v.get("option1"), v.get("option2"), v.get("option3"):
-                    if opt:
-                        option_counter[opt] += 1
-        return {
-            "min_variants": min(variant_counts) if variant_counts else 0,
-            "max_variants": max(variant_counts) if variant_counts else 0,
-            "mean_variants": mean(variant_counts) if variant_counts else 0,
-            "most_common_options": option_counter.most_common(10)
+        plt.figure(figsize=(10, 5))
+        plt.bar(top.keys(), top.values(), alpha=0.7)
+        plt.title(f"Top {top_n} {field.title()}s")
+        plt.xticks(rotation=45, ha="right")
+        plt.ylabel("Product Count")
+        plt.tight_layout()
+        plt.show()
+
+    def compare_snapshots(self, old_file: str, new_file: str) -> Dict[str, List[str]]:
+        """Compare two saved snapshots to find added, removed, or changed products."""
+        def load_products(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return {str(p["id"]): p for p in json.load(f)}
+
+        old = load_products(old_file)
+        new = load_products(new_file)
+
+        old_ids = set(old.keys())
+        new_ids = set(new.keys())
+
+        added = new_ids - old_ids
+        removed = old_ids - new_ids
+        changed = [pid for pid in old_ids & new_ids if old[pid] != new[pid]]
+
+        result = {
+            "added": [new[i]["title"] for i in added],
+            "removed": [old[i]["title"] for i in removed],
+            "changed": [new[i]["title"] for i in changed],
         }
-
-    # ----------------------
-    # Export cached products to CSV / JSON
-    # ----------------------
-    def export_products(self, filename: str, file_type: str = "csv") -> None:
-        if not self.products_cache:
-            raise ValueError("No products cached. Call scrape_and_cache() first.")
-
-        df = pd.json_normalize(self.products_cache, sep="_")
-        if file_type.lower() == "csv":
-            df.to_csv(filename, index=False)
-        elif file_type.lower() == "json":
-            df.to_json(filename, orient="records", indent=4)
-        else:
-            raise ValueError("file_type must be 'csv' or 'json'.")
+        print(f"[INFO] Changes since last snapshot: {result}")
+        return result
