@@ -1,0 +1,1 @@
+A basic project to help users quickly scrape Shopify based websites.

@@ -8,3 +8,4 @@ authors = [{name = "Aiden Smith", email = "aiden.smith24@protonmail.com"}]
 license = "MIT"
 license-files = ["LICENSE"]
 dynamic = ["version", "description"]
+readme = "README.md"
