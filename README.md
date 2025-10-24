@@ -127,5 +127,5 @@ Always comply with each website’s terms of service and local laws.
 
 ## Author
 
-Developed by [Your Name] — 2025  
+Developed by Aiden Smith — 2025  
 MIT License
