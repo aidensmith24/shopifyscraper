@@ -21,10 +21,10 @@ class ShopifyScraper:
     """
 
     def __init__(self, store_url: str, proxies: Optional[List[str]] = None, data_dir: str = "data"):
-        # Normalize the store URL
+        # --- Normalize URL ---
         store_url = store_url.strip().rstrip("/")
-
-        # If the user forgot to include https:// or http://
+        if "." not in store_url:
+            store_url += ".myshopify.com"
         if not store_url.startswith(("http://", "https://")):
             store_url = "https://" + store_url
 
@@ -34,6 +34,49 @@ class ShopifyScraper:
         self.products_cache: List[Dict] = []
 
         os.makedirs(self.data_dir, exist_ok=True)
+
+        # --- Verify Shopify before scraping ---
+        if not self.is_definitely_shopify(self.store_url):
+            raise ValueError(f"{self.store_url} does not appear to be a valid Shopify store.")
+
+    # -------------------------------------------------------------------------
+    # Shopify verification
+    # -------------------------------------------------------------------------
+    def is_definitely_shopify(self, url: str) -> bool:
+        """Composite check to confirm a site is a Shopify store."""
+        return (
+            self._is_shopify_products_json(url)
+            or self._has_shopify_headers(url)
+            or self._looks_like_shopify_html(url)
+        )
+
+    def _is_shopify_products_json(self, url: str) -> bool:
+        """Check if /products.json exists and returns valid JSON."""
+        try:
+            r = requests.get(f"{url}/products.json", timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                return isinstance(data, dict) and "products" in data
+        except Exception:
+            pass
+        return False
+
+    def _has_shopify_headers(self, url: str) -> bool:
+        """Check for Shopify-specific response headers."""
+        try:
+            r = requests.head(url, timeout=5)
+            return any("shopify" in h.lower() for h in r.headers.keys())
+        except Exception:
+            return False
+
+    def _looks_like_shopify_html(self, url: str) -> bool:
+        """Look for Shopify-specific HTML markers."""
+        try:
+            r = requests.get(url, timeout=8)
+            html = r.text.lower()
+            return "cdn.shopify.com" in html or "shopify-digital-wallet" in html
+        except Exception:
+            return False
    
     def _get_proxy(self) -> Optional[Dict[str, str]]:
         """Returns a random proxy (if any available)."""
