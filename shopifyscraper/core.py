@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import random
@@ -6,18 +7,21 @@ import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 from collections import Counter
-from statistics import mean, median
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import List, Dict, Optional
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+)
+import tempfile
 
 
 class ShopifyScraper:
     """
-    A full-featured Shopify product scraper and analytics tool.
-    Capabilities:
-    - Scrapes all products from a Shopify store (using proxy rotation if configured)
-    - Performs tag, vendor, and price analysis
-    - Saves daily snapshots for trend tracking
-    - Generates visualizations (price distribution, vendor breakdown)
+    Scrape and analyze public Shopify store data from /products.json endpoints.
+    Includes proxy rotation, validation, analytical summaries, and PDF reporting.
     """
 
     def __init__(self, store_url: str, proxies: Optional[List[str]] = None, data_dir: str = "data"):
@@ -51,7 +55,6 @@ class ShopifyScraper:
         )
 
     def _is_shopify_products_json(self, url: str) -> bool:
-        """Check if /products.json exists and returns valid JSON."""
         try:
             r = requests.get(f"{url}/products.json", timeout=8)
             if r.status_code == 200:
@@ -62,7 +65,6 @@ class ShopifyScraper:
         return False
 
     def _has_shopify_headers(self, url: str) -> bool:
-        """Check for Shopify-specific response headers."""
         try:
             r = requests.head(url, timeout=5)
             return any("shopify" in h.lower() for h in r.headers.keys())
@@ -70,185 +72,275 @@ class ShopifyScraper:
             return False
 
     def _looks_like_shopify_html(self, url: str) -> bool:
-        """Look for Shopify-specific HTML markers."""
         try:
             r = requests.get(url, timeout=8)
             html = r.text.lower()
             return "cdn.shopify.com" in html or "shopify-digital-wallet" in html
         except Exception:
             return False
-   
+
+    # -------------------------------------------------------------------------
+    # Core scraping
+    # -------------------------------------------------------------------------
     def _get_proxy(self) -> Optional[Dict[str, str]]:
-        """Returns a random proxy (if any available)."""
         if not self.proxies:
             return None
         proxy = random.choice(self.proxies)
         return {"http": proxy, "https": proxy}
 
-    def _fetch_page(self, page: int = 1) -> Optional[List[Dict]]:
-        """Fetches one page of products.json."""
-        url = f"{self.store_url}/products.json?page={page}&limit=250"
-        try:
-            response = requests.get(url, proxies=self._get_proxy(), timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return data.get("products", [])
-        except Exception as e:
-            print(f"[WARN] Failed to fetch page {page}: {e}")
-            return None
-
-    def scrape_all_products(self) -> List[Dict]:
-        """Fetches all products across paginated JSON pages."""
+    def scrape_all_products(self, limit: int = 250) -> List[Dict]:
+        """Scrape all products from a Shopify store."""
+        print(f"[INFO] Scraping products from {self.store_url}")
         products = []
         page = 1
-        print(f"[INFO] Starting scrape for {self.store_url}")
+
         while True:
-            page_data = self._fetch_page(page)
-            if not page_data:
+            url = f"{self.store_url}/products.json?limit={limit}&page={page}"
+            proxy = self._get_proxy()
+
+            try:
+                r = requests.get(url, proxies=proxy, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                new_products = data.get("products", [])
+                if not new_products:
+                    break
+                products.extend(new_products)
+                print(f"[INFO] Fetched page {page} ({len(new_products)} products)")
+                page += 1
+                time.sleep(random.uniform(0.5, 1.5))
+            except Exception as e:
+                print(f"[ERROR] Failed on page {page}: {e}")
                 break
-            products.extend(page_data)
-            print(f"[INFO] Page {page}: {len(page_data)} products")
-            page += 1
-            if len(page_data) < 250:
-                break
-            time.sleep(1)  # be polite
-        print(f"[INFO] Scraped total {len(products)} products.")
+
         self.products_cache = products
+        print(f"[INFO] Total products scraped: {len(products)}")
         return products
 
-    def save_snapshot(self, filename: Optional[str] = None) -> str:
-        """Saves current product cache to timestamped JSON file."""
-        if not self.products_cache:
-            raise ValueError("No products cached. Run scrape_all_products() first.")
-
-        if not filename:
-            date = time.strftime("%Y-%m-%d")
-            filename = os.path.join(self.data_dir, f"products_{date}.json")
-
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(self.products_cache, f, indent=2)
-        print(f"[INFO] Snapshot saved: {filename}")
-        return filename
-
-    def load_snapshot(self, filename: str) -> None:
-        """Loads product data from a saved snapshot."""
-        with open(filename, "r", encoding="utf-8") as f:
-            self.products_cache = json.load(f)
-        print(f"[INFO] Loaded snapshot: {filename}")
-
+    # -------------------------------------------------------------------------
+    # Analysis
+    # -------------------------------------------------------------------------
     def tag_summary(self, top_n: int = 10) -> Dict[str, int]:
-        """Returns the most common tags across products (handles string or list formats)."""
         tags = Counter()
         for p in self.products_cache:
             tag_data = p.get("tags", [])
-            
-            # Normalize: ensure we always have a list
             if isinstance(tag_data, str):
                 tag_list = [t.strip() for t in tag_data.split(",") if t.strip()]
             elif isinstance(tag_data, list):
                 tag_list = [t.strip() for t in tag_data if isinstance(t, str) and t.strip()]
             else:
                 tag_list = []
-
-            for tag in tag_list:
-                tags[tag] += 1
-
+            tags.update(tag_list)
         top_tags = dict(tags.most_common(top_n))
         print(f"[INFO] Top {top_n} tags: {top_tags}")
         return top_tags
 
-
     def price_summary(self) -> Dict[str, float]:
-        """Returns basic statistics about variant prices."""
         prices = []
         for p in self.products_cache:
             for v in p.get("variants", []):
                 try:
                     prices.append(float(v.get("price", 0)))
-                except (ValueError, TypeError):
+                except (TypeError, ValueError):
                     continue
 
         if not prices:
-            print("[WARN] No prices found.")
+            print("[WARN] No valid prices found.")
             return {}
 
-        stats = {
+        summary = {
             "count": len(prices),
             "min": min(prices),
             "max": max(prices),
-            "mean": mean(prices),
-            "median": median(prices),
+            "mean": round(sum(prices) / len(prices), 2),
+            "median": float(pd.Series(prices).median()),
         }
-        print(f"[INFO] Price summary: {stats}")
-        return stats
+        print(f"[INFO] Price summary: {summary}")
+        return summary
 
     def stock_summary(self) -> Dict[str, int]:
-        """Estimates stock availability (based on variant 'available' flag)."""
-        available, unavailable = 0, 0
+        total, in_stock = 0, 0
         for p in self.products_cache:
             for v in p.get("variants", []):
+                total += 1
                 if v.get("available", False):
-                    available += 1
-                else:
-                    unavailable += 1
-        return {"available": available, "unavailable": unavailable}
+                    in_stock += 1
+        summary = {"total_variants": total, "in_stock": in_stock, "out_of_stock": total - in_stock}
+        print(f"[INFO] Stock summary: {summary}")
+        return summary
 
-    def plot_price_distribution(self, bins: int = 20):
-        """Plots histogram of variant prices."""
-        prices = [
-            float(v["price"])
-            for p in self.products_cache
-            for v in p.get("variants", [])
-            if v.get("price")
-        ]
-        if not prices:
-            print("[WARN] No price data to plot.")
+    def avg_price_by(self, field: str = "vendor") -> pd.Series:
+        data = {}
+        for p in self.products_cache:
+            key = p.get(field, "Unknown")
+            prices = [float(v.get("price", 0)) for v in p.get("variants", []) if v.get("price")]
+            if prices:
+                data.setdefault(key, []).extend(prices)
+        avg_prices = {k: round(sum(v) / len(v), 2) for k, v in data.items()}
+        df = pd.Series(avg_prices).sort_values(ascending=False)
+        return df
+
+    def discount_summary(self) -> Dict[str, float]:
+        discounts = []
+        for p in self.products_cache:
+            for v in p.get("variants", []):
+                price = float(v.get("price", 0) or 0)
+                compare = float(v.get("compare_at_price") or 0)
+                if compare > price > 0:
+                    discount = round((compare - price) / compare * 100, 2)
+                    discounts.append(discount)
+        if not discounts:
+            return {}
+        summary = {
+            "count": len(discounts),
+            "avg_discount_%": round(sum(discounts) / len(discounts), 2),
+            "max_discount_%": max(discounts)
+        }
+        return summary
+
+    def inventory_value(self) -> float:
+        total_value = 0
+        for p in self.products_cache:
+            for v in p.get("variants", []):
+                try:
+                    qty = int(v.get("inventory_quantity", 0))
+                    price = float(v.get("price", 0))
+                    total_value += qty * price
+                except Exception:
+                    continue
+        return total_value
+
+    def keyword_summary(self, top_n: int = 15) -> Dict[str, int]:
+        titles = [p.get("title", "").lower() for p in self.products_cache]
+        words = []
+        for t in titles:
+            words.extend(re.findall(r"[a-zA-Z]+", t))
+        common = Counter(words)
+        for w in ["the", "and", "of", "for", "a", "in"]:
+            common.pop(w, None)
+        return dict(common.most_common(top_n))
+
+    # -------------------------------------------------------------------------
+    # Report generation with plots
+    # -------------------------------------------------------------------------
+    def generate_report(self, filename: str = "shopify_report.pdf"):
+        """Generate a professional PDF report summarizing product data with visualizations."""
+        if not self.products_cache:
+            print("[WARN] No products loaded — scrape or load a snapshot first.")
             return
 
-        plt.figure(figsize=(8, 5))
-        plt.hist(prices, bins=bins, alpha=0.7)
-        plt.title("Price Distribution")
-        plt.xlabel("Price")
-        plt.ylabel("Number of Variants")
-        plt.grid(True, alpha=0.3)
-        plt.show()
+        doc = SimpleDocTemplate(filename, pagesize=A4)
+        styles = getSampleStyleSheet()
+        story = []
 
-    def plot_distribution(self, field: str = "vendor", top_n: int = 10):
-        """Plots a bar chart of top vendors or product types."""
-        counter = Counter()
-        for p in self.products_cache:
-            key = p.get(field) or "Unknown"
-            counter[key] += 1
-        top = dict(counter.most_common(top_n))
+        store_name = self.store_url.replace("https://", "").replace("http://", "")
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        plt.figure(figsize=(10, 5))
-        plt.bar(top.keys(), top.values(), alpha=0.7)
-        plt.title(f"Top {top_n} {field.title()}s")
-        plt.xticks(rotation=45, ha="right")
-        plt.ylabel("Product Count")
-        plt.tight_layout()
-        plt.show()
+        story.append(Paragraph(f"<b>Shopify Store Analysis Report</b>", styles["Title"]))
+        story.append(Paragraph(f"Store: {store_name}", styles["Normal"]))
+        story.append(Paragraph(f"Generated: {date_str}", styles["Normal"]))
+        story.append(Spacer(1, 12))
 
-    def compare_snapshots(self, old_file: str, new_file: str) -> Dict[str, List[str]]:
-        """Compare two saved snapshots to find added, removed, or changed products."""
-        def load_products(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return {str(p["id"]): p for p in json.load(f)}
+        # Summary
+        price_summary = self.price_summary()
+        stock_summary = self.stock_summary()
+        inventory_value = self.inventory_value()
 
-        old = load_products(old_file)
-        new = load_products(new_file)
+        summary_data = [
+            ["Total Products", len(self.products_cache)],
+            ["Average Price ($)", price_summary.get("mean", "N/A")],
+            ["Median Price ($)", price_summary.get("median", "N/A")],
+            ["Min Price ($)", price_summary.get("min", "N/A")],
+            ["Max Price ($)", price_summary.get("max", "N/A")],
+            ["In Stock Variants", stock_summary.get("in_stock", "N/A")],
+            ["Out of Stock Variants", stock_summary.get("out_of_stock", "N/A")],
+            ["Estimated Inventory Value ($)", f"{inventory_value:,.2f}"],
+        ]
 
-        old_ids = set(old.keys())
-        new_ids = set(new.keys())
+        table = Table(summary_data, colWidths=[200, 200])
+        table.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 1, colors.black),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ]))
+        story.append(Paragraph("<b>Summary Statistics</b>", styles["Heading2"]))
+        story.append(table)
+        story.append(Spacer(1, 18))
 
-        added = new_ids - old_ids
-        removed = old_ids - new_ids
-        changed = [pid for pid in old_ids & new_ids if old[pid] != new[pid]]
+        # Price distribution plot
+        prices = [float(v.get("price", 0)) for p in self.products_cache for v in p.get("variants", [])]
+        if prices:
+            tmp_price_plot = os.path.join(tempfile.gettempdir(), "price_distribution.png")
+            plt.figure(figsize=(6, 3))
+            plt.hist(prices, bins=20, edgecolor="black")
+            plt.title("Price Distribution")
+            plt.xlabel("Price ($)")
+            plt.ylabel("Count")
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(tmp_price_plot)
+            plt.close()
 
-        result = {
-            "added": [new[i]["title"] for i in added],
-            "removed": [old[i]["title"] for i in removed],
-            "changed": [new[i]["title"] for i in changed],
-        }
-        print(f"[INFO] Changes since last snapshot: {result}")
-        return result
+            story.append(Paragraph("<b>Price Distribution</b>", styles["Heading2"]))
+            story.append(Image(tmp_price_plot, width=400, height=200))
+            story.append(Spacer(1, 18))
+
+        # Average price by vendor plot
+        avg_vendor = self.avg_price_by("vendor")
+        if not avg_vendor.empty:
+            tmp_vendor_plot = os.path.join(tempfile.gettempdir(), "avg_price_by_vendor.png")
+            plt.figure(figsize=(6, 3))
+            avg_vendor.plot(kind="bar", color="skyblue", edgecolor="black")
+            plt.title("Average Price by Vendor")
+            plt.xlabel("Vendor")
+            plt.ylabel("Avg Price ($)")
+            plt.xticks(rotation=45, ha="right")
+            plt.grid(axis="y", alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(tmp_vendor_plot)
+            plt.close()
+
+            story.append(Paragraph("<b>Average Price by Vendor</b>", styles["Heading2"]))
+            story.append(Image(tmp_vendor_plot, width=400, height=200))
+            story.append(Spacer(1, 18))
+
+        # Discounts
+        discounts = self.discount_summary()
+        story.append(Paragraph("<b>Discount Summary</b>", styles["Heading2"]))
+        if discounts:
+            for k, v in discounts.items():
+                story.append(Paragraph(f"{k.replace('_', ' ').title()}: {v}", styles["Normal"]))
+        else:
+            story.append(Paragraph("No discounted products found.", styles["Normal"]))
+        story.append(Spacer(1, 18))
+
+        # Tags
+        tags = self.tag_summary()
+        story.append(Paragraph("<b>Top Tags</b>", styles["Heading2"]))
+        if tags:
+            tag_data = [["Tag", "Count"]] + [[k, v] for k, v in tags.items()]
+            ttable = Table(tag_data, colWidths=[250, 150])
+            ttable.setStyle(TableStyle([
+                ("BOX", (0, 0), (-1, -1), 1, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ]))
+            story.append(ttable)
+        else:
+            story.append(Paragraph("No tags available.", styles["Normal"]))
+        story.append(Spacer(1, 18))
+
+        # Keywords
+        keywords = self.keyword_summary()
+        story.append(Paragraph("<b>Top Keywords</b>", styles["Heading2"]))
+        if keywords:
+            kw_data = [["Keyword", "Count"]] + [[k, v] for k, v in keywords.items()]
+            ktable = Table(kw_data, colWidths=[250, 150])
+            ktable.setStyle(TableStyle([
+                ("BOX", (0, 0), (-1, -1), 1, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ]))
+            story.append(ktable)
+        else:
+            story.append(Paragraph("No keyword data available.", styles["Normal"]))
+
+        doc.build(story)
+        print(f"[INFO] Report generated: {filename}")

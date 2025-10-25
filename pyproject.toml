@@ -9,4 +9,4 @@ license = "MIT"
 license-files = ["LICENSE"]
 dynamic = ["version", "description"]
 readme = "README.md"
-dependencies = ['requests', 'pandas', 'matplotlib']
+dependencies = ['requests', 'pandas', 'matplotlib', 'reportlab']
