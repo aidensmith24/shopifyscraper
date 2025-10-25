@@ -79,12 +79,6 @@ shop.generate_report("shopify_report.pdf")
 
 **The PDF includes:**
 
-#### Price Distribution  
-![Price Distribution Example](https://via.placeholder.com/400x200.png?text=Price+Distribution)
-
-#### Average Price by Vendor  
-![Average Price by Vendor Example](https://via.placeholder.com/400x200.png?text=Average+Price+by+Vendor)
-
 #### Summary Table Example
 | Metric | Value |
 |--------|--------|
